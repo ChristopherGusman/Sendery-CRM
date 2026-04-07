@@ -26,10 +26,11 @@ jobs:
       - name: Install dependencies
         run: npm install
 
+      - name: Fix permissions
+        run: chmod +x node_modules/.bin/vite
+
       - name: Build
         run: npm run build
-        - name: Fix permissions
-  run: chmod +x node_modules/.bin/vite
 
       - name: Setup Pages
         uses: actions/configure-pages@v5
