@@ -19,16 +19,28 @@ const C = {
 
 async function getJsPDF() {
   if (window.jspdf) return window.jspdf.jsPDF
-  await loadScript('https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js')
-  await loadScript('https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js')
+  await loadScript(
+    'https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js',
+    'sha512-qZvrmS2ekKPF2mSznTQsxqPgnpkI4DNTlrdUmTzrDgektczlKNRRhy5X5AAOnx5S09ydFYWWNSfcEqDTTHgtNA=='
+  )
+  await loadScript(
+    'https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js',
+    'sha512-2/YdOMV+YNpanLCF5MdQwaoFRVbTmrJ4u4EpqS/USXAQNUDgI5uwYi6J98WVtJKcfe1AbgerygzDFToxAlOGEQ=='
+  )
   return window.jspdf.jsPDF
 }
 
-function loadScript(src) {
+// SRI (integrity) evita que un CDN comprometido o un MITM inyecten
+// JavaScript arbitrario: el navegador rechaza el script si su hash
+// no coincide exactamente con el esperado.
+function loadScript(src, integrity) {
   return new Promise((resolve, reject) => {
     if (document.querySelector(`script[src="${src}"]`)) { resolve(); return }
     const s = document.createElement('script')
-    s.src = src; s.onload = resolve; s.onerror = reject
+    s.src = src
+    s.integrity = integrity
+    s.crossOrigin = 'anonymous'
+    s.onload = resolve; s.onerror = reject
     document.head.appendChild(s)
   })
 }

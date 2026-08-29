@@ -3,8 +3,9 @@ import { NavLink, useLocation } from 'react-router-dom'
 import {
   LayoutDashboard, CalendarDays, Users, Receipt,
   Truck, Landmark, FileBarChart2, ChevronLeft, ChevronRight,
-  Mountain, FileUp
+  Mountain, FileUp, LogOut
 } from 'lucide-react'
+import { useDB } from '../db/DBContext.jsx'
 
 const NAV_ITEMS = [
   { to: '/', icon: LayoutDashboard, label: 'Dashboard' },
@@ -20,6 +21,7 @@ const NAV_ITEMS = [
 export default function Sidebar() {
   const [collapsed, setCollapsed] = useState(false)
   const location = useLocation()
+  const { session, signOut } = useDB() || {}
 
   return (
     <aside style={{
@@ -136,11 +138,26 @@ export default function Sidebar() {
         }}>
           <div style={{ color: '#C4A97D', fontWeight: 500 }}>Sendery CRM v1.0</div>
           <div>Ensenada, Baja California</div>
-          <div style={{ marginTop: 4 }}>
+          <div style={{ marginTop: 4, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
             <span style={{
               background: '#EAF0D8', color: '#2C3A1A',
               padding: '1px 6px', borderRadius: 4, fontSize: 10, fontWeight: 600
             }}>MXN</span>
+            {session && (
+              <button
+                onClick={signOut}
+                title={session.user?.email}
+                style={{
+                  display: 'flex', alignItems: 'center', gap: 4,
+                  background: 'none', border: 'none', cursor: 'pointer',
+                  color: '#C4A97D', fontFamily: 'DM Sans', fontSize: 11
+                }}
+                onMouseEnter={e => e.currentTarget.style.color = '#E8C547'}
+                onMouseLeave={e => e.currentTarget.style.color = '#C4A97D'}
+              >
+                <LogOut size={12} /> Salir
+              </button>
+            )}
           </div>
         </div>
       )}
