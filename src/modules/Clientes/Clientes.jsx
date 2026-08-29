@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react'
-import { query, run } from '../../db/database.js'
+import { supabase } from '../../lib/supabase.js'
 import { formatMXN, formatDate, getPaymentStatus, today } from '../../utils/format.js'
 import {
   PageHeader, PageContent, Card, Btn, Badge, Table, TR, TD,
@@ -22,32 +22,36 @@ export default function Clientes() {
 
   useEffect(() => { loadClientes() }, [])
 
-  function loadClientes() {
-    const rows = query(`
-      SELECT c.*,
-        COUNT(DISTINCT p.evento_id) as total_eventos,
-        COALESCE(SUM(a.monto),0) as total_pagado,
-        COALESCE(SUM(p.saldo_pendiente),0) as deuda_activa
-      FROM clientes c
-      LEFT JOIN participantes p ON p.cliente_id = c.id
-      LEFT JOIN abonos a ON a.cliente_id = c.id
-      GROUP BY c.id ORDER BY c.nombre
-    `)
+  async function loadClientes() {
+    const { data } = await supabase
+      .from('clientes')
+      .select('*, participantes(evento_id, saldo_pendiente), abonos(monto)')
+      .order('nombre')
+
+    const rows = (data || []).map(c => ({
+      ...c,
+      total_eventos: new Set((c.participantes || []).map(p => p.evento_id)).size,
+      total_pagado: (c.abonos || []).reduce((s, a) => s + Number(a.monto), 0),
+      deuda_activa: (c.participantes || []).reduce((s, p) => s + Number(p.saldo_pendiente), 0),
+    }))
     setClientes(rows)
   }
 
-  function openDetalle(c) {
+  async function openDetalle(c) {
     setDetalle(c)
-    const h = query(`
-      SELECT e.nombre as evento, e.fecha, e.tipo,
-        p.monto_total_acordado, p.saldo_pendiente,
-        COALESCE(SUM(a.monto),0) as pagado
-      FROM participantes p
-      JOIN eventos e ON e.id = p.evento_id
-      LEFT JOIN abonos a ON a.participante_id = p.id
-      WHERE p.cliente_id = ?
-      GROUP BY p.id ORDER BY e.fecha DESC
-    `, [c.id])
+    const { data } = await supabase
+      .from('participantes')
+      .select('*, eventos(nombre, fecha, tipo), abonos(monto)')
+      .eq('cliente_id', c.id)
+
+    const h = (data || []).map(p => ({
+      evento: p.eventos?.nombre || '',
+      fecha: p.eventos?.fecha || '',
+      tipo: p.eventos?.tipo || '',
+      monto_total_acordado: p.monto_total_acordado,
+      saldo_pendiente: p.saldo_pendiente,
+      pagado: (p.abonos || []).reduce((s, a) => s + Number(a.monto), 0),
+    })).sort((a, b) => (b.fecha || '').localeCompare(a.fecha || ''))
     setHistorial(h)
   }
 
@@ -76,23 +80,25 @@ export default function Clientes() {
     return Object.keys(e).length === 0
   }
 
-  function handleSave() {
+  async function handleSave() {
     if (!validate()) return
+    const payload = {
+      nombre: form.nombre, telefono: form.telefono, email: form.email,
+      ciudad: form.ciudad, fecha_registro: form.fecha_registro, notas: form.notas
+    }
     if (editando) {
-      run(`UPDATE clientes SET nombre=?, telefono=?, email=?, ciudad=?, fecha_registro=?, notas=? WHERE id=?`,
-        [form.nombre, form.telefono, form.email, form.ciudad, form.fecha_registro, form.notas, editando])
+      await supabase.from('clientes').update(payload).eq('id', editando)
     } else {
-      run(`INSERT INTO clientes (nombre, telefono, email, ciudad, fecha_registro, notas) VALUES (?,?,?,?,?,?)`,
-        [form.nombre, form.telefono, form.email, form.ciudad, form.fecha_registro, form.notas])
+      await supabase.from('clientes').insert(payload)
     }
     setModal(false); loadClientes()
   }
 
-  function deleteCliente(id) {
+  async function deleteCliente(id) {
     if (!confirm('¿Eliminar cliente? Se mantendrán sus registros históricos.')) return
-    run(`UPDATE participantes SET cliente_id=NULL WHERE cliente_id=?`, [id])
-    run(`UPDATE abonos SET cliente_id=NULL WHERE cliente_id=?`, [id])
-    run(`DELETE FROM clientes WHERE id=?`, [id])
+    await supabase.from('participantes').update({ cliente_id: null }).eq('cliente_id', id)
+    await supabase.from('abonos').update({ cliente_id: null }).eq('cliente_id', id)
+    await supabase.from('clientes').delete().eq('id', id)
     loadClientes()
     if (detalle?.id === id) setDetalle(null)
   }

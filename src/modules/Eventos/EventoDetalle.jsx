@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
-import { query, run, getLastInsertId } from '../../db/database.js'
+import { supabase } from '../../lib/supabase.js'
 import { formatMXN, formatDate, getPaymentStatus, getEventoStatus, generateFolio, today } from '../../utils/format.js'
 import {
   PageHeader, PageContent, Card, Btn, Badge, Table, TR, TD,
@@ -30,30 +30,38 @@ export default function EventoDetalle() {
 
   useEffect(() => { loadTodo() }, [id])
 
-  function loadTodo() {
-    const ev = query(`SELECT * FROM eventos WHERE id=?`, [id])[0]
-    setEvento(ev)
-    const parts = query(`
-      SELECT p.*, c.telefono, c.email
-      FROM participantes p
-      LEFT JOIN clientes c ON c.id = p.cliente_id
-      WHERE p.evento_id=? ORDER BY p.nombre_cliente
-    `, [id])
-    // Cargar abonos de cada participante
-    const partsConAbonos = parts.map(p => ({
+  async function loadTodo() {
+    const [evRes, partsRes, clientesRes, gastosRes, cuentasRes] = await Promise.all([
+      supabase.from('eventos').select('*').eq('id', id).single(),
+      supabase.from('participantes')
+        .select('*, clientes(telefono, email), abonos(*)')
+        .eq('evento_id', id)
+        .order('nombre_cliente'),
+      supabase.from('clientes').select('*').order('nombre'),
+      supabase.from('gastos')
+        .select('*, proveedores(nombre), cuentas_bancarias(banco, ultimos_4)')
+        .eq('evento_id', id)
+        .order('fecha'),
+      supabase.from('cuentas_bancarias').select('*').order('banco'),
+    ])
+
+    setEvento(evRes.data)
+
+    const parts = (partsRes.data || []).map(p => ({
       ...p,
-      abonos: query(`SELECT * FROM abonos WHERE participante_id=? ORDER BY fecha`, [p.id])
+      abonos: (p.abonos || []).sort((a, b) => a.fecha.localeCompare(b.fecha)),
     }))
-    setParticipantes(partsConAbonos)
-    setClientes(query(`SELECT * FROM clientes ORDER BY nombre`))
-    setGastos(query(`
-      SELECT g.*, pr.nombre as proveedor_nombre, cb.banco, cb.ultimos_4
-      FROM gastos g
-      LEFT JOIN proveedores pr ON pr.id = g.proveedor_id
-      LEFT JOIN cuentas_bancarias cb ON cb.id = g.cuenta_bancaria_id
-      WHERE g.evento_id=? ORDER BY g.fecha
-    `, [id]))
-    setCuentas(query(`SELECT * FROM cuentas_bancarias ORDER BY banco`))
+    setParticipantes(parts)
+    setClientes(clientesRes.data || [])
+
+    const gastosMap = (gastosRes.data || []).map(g => ({
+      ...g,
+      proveedor_nombre: g.proveedores?.nombre || null,
+      banco: g.cuentas_bancarias?.banco || null,
+      ultimos_4: g.cuentas_bancarias?.ultimos_4 || null,
+    }))
+    setGastos(gastosMap)
+    setCuentas(cuentasRes.data || [])
   }
 
   if (!evento) return <div style={{ padding: 32, fontFamily: 'DM Sans', color: '#6B7B4F' }}>Cargando...</div>
@@ -80,7 +88,7 @@ export default function EventoDetalle() {
     setPartModal(true)
   }
 
-  function savePart() {
+  async function savePart() {
     const e = {}
     if (!partForm.nombre_cliente.trim()) e.nombre_cliente = 'Nombre requerido'
     if (!partForm.monto_total_acordado || Number(partForm.monto_total_acordado) < 0) e.monto_total_acordado = 'Monto inválido'
@@ -89,29 +97,37 @@ export default function EventoDetalle() {
 
     const monto = Number(partForm.monto_total_acordado)
     if (editPart) {
-      // Recalcular saldo según abonos existentes
-      const abonosSum = query(`SELECT COALESCE(SUM(monto),0) as t FROM abonos WHERE participante_id=?`, [editPart])[0]?.t || 0
-      const newSaldo = Math.max(0, monto - Number(abonosSum))
-      run(`UPDATE participantes SET cliente_id=?, nombre_cliente=?, monto_total_acordado=?,
-        saldo_pendiente=?, cuenta_destino_pago=?, notas=? WHERE id=?`, [
-        partForm.cliente_id || null, partForm.nombre_cliente, monto,
-        newSaldo, partForm.cuenta_destino_pago, partForm.notas, editPart
-      ])
+      const { data: abonosData } = await supabase
+        .from('abonos').select('monto').eq('participante_id', editPart)
+      const abonosSum = (abonosData || []).reduce((s, a) => s + Number(a.monto), 0)
+      const newSaldo = Math.max(0, monto - abonosSum)
+      await supabase.from('participantes').update({
+        cliente_id: partForm.cliente_id || null,
+        nombre_cliente: partForm.nombre_cliente,
+        monto_total_acordado: monto,
+        saldo_pendiente: newSaldo,
+        cuenta_destino_pago: partForm.cuenta_destino_pago,
+        notas: partForm.notas,
+      }).eq('id', editPart)
     } else {
-      run(`INSERT INTO participantes (evento_id, cliente_id, nombre_cliente, monto_total_acordado,
-        saldo_pendiente, cuenta_destino_pago, notas) VALUES (?,?,?,?,?,?,?)`, [
-        id, partForm.cliente_id || null, partForm.nombre_cliente,
-        monto, monto, partForm.cuenta_destino_pago, partForm.notas
-      ])
+      await supabase.from('participantes').insert({
+        evento_id: Number(id),
+        cliente_id: partForm.cliente_id || null,
+        nombre_cliente: partForm.nombre_cliente,
+        monto_total_acordado: monto,
+        saldo_pendiente: monto,
+        cuenta_destino_pago: partForm.cuenta_destino_pago,
+        notas: partForm.notas,
+      })
     }
     setPartModal(false)
     loadTodo()
   }
 
-  function deletePart(pid) {
+  async function deletePart(pid) {
     if (!confirm('¿Eliminar participante y sus abonos?')) return
-    run(`DELETE FROM abonos WHERE participante_id=?`, [pid])
-    run(`DELETE FROM participantes WHERE id=?`, [pid])
+    await supabase.from('abonos').delete().eq('participante_id', pid)
+    await supabase.from('participantes').delete().eq('id', pid)
     loadTodo()
   }
 
@@ -122,7 +138,7 @@ export default function EventoDetalle() {
     setErrors({})
   }
 
-  function saveAbono() {
+  async function saveAbono() {
     const e = {}
     if (!abonoForm.fecha) e.fecha = 'Fecha requerida'
     if (!abonoForm.monto || Number(abonoForm.monto) <= 0) e.monto = 'Monto inválido'
@@ -132,27 +148,40 @@ export default function EventoDetalle() {
     const monto = Number(abonoForm.monto)
     const folio = abonoForm.referencia || generateFolio('ABN')
 
-    run(`INSERT INTO abonos (participante_id, evento_id, cliente_id, fecha, monto, referencia, cuenta_destino, notas)
-      VALUES (?,?,?,?,?,?,?,?)`, [
-      abonoModal.id, id, abonoModal.cliente_id || null,
-      abonoForm.fecha, monto, folio, abonoForm.cuenta_destino, abonoForm.notas
-    ])
+    await supabase.from('abonos').insert({
+      participante_id: abonoModal.id,
+      evento_id: Number(id),
+      cliente_id: abonoModal.cliente_id || null,
+      fecha: abonoForm.fecha,
+      monto,
+      referencia: folio,
+      cuenta_destino: abonoForm.cuenta_destino,
+      notas: abonoForm.notas,
+    })
 
-    // Actualizar saldo pendiente
     const newSaldo = Math.max(0, Number(abonoModal.saldo_pendiente) - monto)
-    run(`UPDATE participantes SET saldo_pendiente=?, fecha_ultimo_pago=? WHERE id=?`,
-      [newSaldo, abonoForm.fecha, abonoModal.id])
+    await supabase.from('participantes').update({
+      saldo_pendiente: newSaldo,
+      fecha_ultimo_pago: abonoForm.fecha,
+    }).eq('id', abonoModal.id)
 
-    // Movimiento bancario
-    const cuenta = cuentas.find(c => `${c.banco} ${c.ultimos_4}` === abonoForm.cuenta_destino || c.banco === abonoForm.cuenta_destino)
+    const cuenta = cuentas.find(c =>
+      `${c.banco} ${c.ultimos_4}` === abonoForm.cuenta_destino ||
+      c.banco === abonoForm.cuenta_destino
+    )
     if (cuenta) {
-      run(`INSERT INTO movimientos (cuenta_id, fecha, tipo, concepto, importe, referencia, evento_id)
-        VALUES (?,?,?,?,?,?,?)`, [
-        cuenta.id, abonoForm.fecha, 'ingreso',
-        `Abono ${abonoModal.nombre_cliente} — ${evento.nombre}`,
-        monto, folio, id
-      ])
-      run(`UPDATE cuentas_bancarias SET saldo_actual = saldo_actual + ? WHERE id=?`, [monto, cuenta.id])
+      await supabase.from('movimientos').insert({
+        cuenta_id: cuenta.id,
+        fecha: abonoForm.fecha,
+        tipo: 'ingreso',
+        concepto: `Abono ${abonoModal.nombre_cliente} — ${evento.nombre}`,
+        importe: monto,
+        referencia: folio,
+        evento_id: Number(id),
+      })
+      await supabase.from('cuentas_bancarias')
+        .update({ saldo_actual: cuenta.saldo_actual + monto })
+        .eq('id', cuenta.id)
     }
 
     setAbonoModal(null)

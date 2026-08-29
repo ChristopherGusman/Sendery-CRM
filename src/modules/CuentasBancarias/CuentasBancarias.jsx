@@ -1,11 +1,11 @@
 import React, { useState, useEffect } from 'react'
-import { query, run } from '../../db/database.js'
+import { supabase } from '../../lib/supabase.js'
 import { formatMXN, formatDate, today } from '../../utils/format.js'
 import {
   PageHeader, PageContent, Card, Btn, Badge, Table, TR, TD,
   Modal, FormField, Input, Select, SearchBar
 } from '../../components/Layout.jsx'
-import { Plus, TrendingUp, TrendingDown, X, Landmark } from 'lucide-react'
+import { Plus, TrendingUp, TrendingDown, X } from 'lucide-react'
 
 const EMPTY = { banco: '', ultimos_4: '', titular: '', tipo: 'cheques', saldo_actual: '' }
 const EMPTY_MOV = { fecha: today(), tipo: 'ingreso', concepto: '', importe: '', referencia: '', evento_id: '' }
@@ -23,32 +23,53 @@ export default function CuentasBancarias() {
   const [movForm, setMovForm] = useState(EMPTY_MOV)
   const [eventos, setEventos] = useState([])
 
-  useEffect(() => {
-    loadCuentas()
-    setEventos(query(`SELECT id, nombre FROM eventos ORDER BY fecha DESC`))
-  }, [])
+  useEffect(() => { loadAll() }, [])
 
-  function loadCuentas() {
-    const rows = query(`
-      SELECT cb.*,
-        COALESCE(SUM(CASE WHEN m.tipo='ingreso' THEN m.importe ELSE 0 END),0) as total_ingresos,
-        COALESCE(SUM(CASE WHEN m.tipo='egreso' THEN m.importe ELSE 0 END),0) as total_egresos,
-        COUNT(m.id) as num_movimientos
-      FROM cuentas_bancarias cb
-      LEFT JOIN movimientos m ON m.cuenta_id = cb.id
-      GROUP BY cb.id ORDER BY cb.banco
-    `)
+  async function loadAll() {
+    const [cuentasRes, eventosRes] = await Promise.all([
+      supabase.from('cuentas_bancarias')
+        .select('*, movimientos(tipo, importe)')
+        .order('banco'),
+      supabase.from('eventos').select('id, nombre').order('fecha', { ascending: false }),
+    ])
+
+    const rows = (cuentasRes.data || []).map(c => ({
+      ...c,
+      total_ingresos: (c.movimientos || []).filter(m => m.tipo === 'ingreso').reduce((s, m) => s + Number(m.importe), 0),
+      total_egresos: (c.movimientos || []).filter(m => m.tipo === 'egreso').reduce((s, m) => s + Number(m.importe), 0),
+      num_movimientos: (c.movimientos || []).length,
+    }))
+    setCuentas(rows)
+    setEventos(eventosRes.data || [])
+  }
+
+  async function loadCuentas() {
+    const { data } = await supabase
+      .from('cuentas_bancarias')
+      .select('*, movimientos(tipo, importe)')
+      .order('banco')
+
+    const rows = (data || []).map(c => ({
+      ...c,
+      total_ingresos: (c.movimientos || []).filter(m => m.tipo === 'ingreso').reduce((s, m) => s + Number(m.importe), 0),
+      total_egresos: (c.movimientos || []).filter(m => m.tipo === 'egreso').reduce((s, m) => s + Number(m.importe), 0),
+      num_movimientos: (c.movimientos || []).length,
+    }))
     setCuentas(rows)
   }
 
-  function loadMovimientos(cid) {
-    const rows = query(`
-      SELECT m.*, e.nombre as evento_nombre
-      FROM movimientos m
-      LEFT JOIN eventos e ON e.id = m.evento_id
-      WHERE m.cuenta_id = ? ORDER BY m.fecha DESC, m.id DESC
-    `, [cid])
-    setMovimientos(rows)
+  async function loadMovimientos(cid) {
+    const { data } = await supabase
+      .from('movimientos')
+      .select('*, eventos(nombre)')
+      .eq('cuenta_id', cid)
+      .order('fecha', { ascending: false })
+      .order('id', { ascending: false })
+
+    setMovimientos((data || []).map(m => ({
+      ...m,
+      evento_nombre: m.eventos?.nombre || null,
+    })))
   }
 
   function seleccionar(c) {
@@ -68,37 +89,51 @@ export default function CuentasBancarias() {
     setEditando(c.id); setErrors({}); setModal(true)
   }
 
-  function handleSave() {
+  async function handleSave() {
     const e = {}
     if (!form.banco.trim()) e.banco = 'Banco requerido'
     if (!form.titular.trim()) e.titular = 'Titular requerido'
     if (!form.ultimos_4 || form.ultimos_4.length !== 4) e.ultimos_4 = '4 dígitos requeridos'
     setErrors(e)
     if (Object.keys(e).length) return
+    const payload = {
+      banco: form.banco, ultimos_4: form.ultimos_4, titular: form.titular,
+      tipo: form.tipo, saldo_actual: Number(form.saldo_actual) || 0
+    }
     if (editando) {
-      run(`UPDATE cuentas_bancarias SET banco=?, ultimos_4=?, titular=?, tipo=?, saldo_actual=? WHERE id=?`,
-        [form.banco, form.ultimos_4, form.titular, form.tipo, Number(form.saldo_actual)||0, editando])
+      await supabase.from('cuentas_bancarias').update(payload).eq('id', editando)
     } else {
-      run(`INSERT INTO cuentas_bancarias (banco, ultimos_4, titular, tipo, saldo_actual) VALUES (?,?,?,?,?)`,
-        [form.banco, form.ultimos_4, form.titular, form.tipo, Number(form.saldo_actual)||0])
+      await supabase.from('cuentas_bancarias').insert(payload)
     }
     setModal(false); loadCuentas()
   }
 
-  function saveMov() {
+  async function saveMov() {
     const e = {}
     if (!movForm.fecha) e.fecha = 'Requerida'
     if (!movForm.concepto.trim()) e.concepto = 'Requerido'
     if (!movForm.importe || Number(movForm.importe) <= 0) e.importe = 'Inválido'
     setErrors(e)
     if (Object.keys(e).length) return
+
     const monto = Number(movForm.importe)
-    run(`INSERT INTO movimientos (cuenta_id, fecha, tipo, concepto, importe, referencia, evento_id) VALUES (?,?,?,?,?,?,?)`,
-      [seleccionada.id, movForm.fecha, movForm.tipo, movForm.concepto, monto,
-       movForm.referencia, movForm.evento_id||null])
+    await supabase.from('movimientos').insert({
+      cuenta_id: seleccionada.id,
+      fecha: movForm.fecha,
+      tipo: movForm.tipo,
+      concepto: movForm.concepto,
+      importe: monto,
+      referencia: movForm.referencia,
+      evento_id: movForm.evento_id || null,
+    })
     const delta = movForm.tipo === 'ingreso' ? monto : -monto
-    run(`UPDATE cuentas_bancarias SET saldo_actual = saldo_actual + ? WHERE id=?`, [delta, seleccionada.id])
-    setMovModal(false); loadCuentas(); loadMovimientos(seleccionada.id)
+    await supabase.from('cuentas_bancarias')
+      .update({ saldo_actual: seleccionada.saldo_actual + delta })
+      .eq('id', seleccionada.id)
+
+    setMovModal(false)
+    loadCuentas()
+    loadMovimientos(seleccionada.id)
   }
 
   const f = (k, v) => setForm(p => ({ ...p, [k]: v }))

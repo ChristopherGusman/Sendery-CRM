@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react'
-import { query, run } from '../../db/database.js'
+import { supabase } from '../../lib/supabase.js'
 import { formatMXN, formatDate, today } from '../../utils/format.js'
 import {
   PageHeader, PageContent, Card, Btn, Badge, Table, TR, TD,
@@ -23,32 +23,52 @@ export default function Proveedores() {
   const [pagoForm, setPagoForm] = useState(EMPTY_PAGO)
   const [cuentas, setCuentas] = useState([])
 
-  useEffect(() => {
-    loadProveedores()
-    setCuentas(query(`SELECT * FROM cuentas_bancarias ORDER BY banco`))
-  }, [])
+  useEffect(() => { loadAll() }, [])
 
-  function loadProveedores() {
-    const rows = query(`
-      SELECT pr.*,
-        COUNT(DISTINCT pp.id) as total_pagos,
-        COALESCE(SUM(pp.importe),0) as total_pagado
-      FROM proveedores pr
-      LEFT JOIN pagos_proveedores pp ON pp.proveedor_id = pr.id
-      GROUP BY pr.id ORDER BY pr.nombre
-    `)
+  async function loadAll() {
+    const [provRes, cuentasRes] = await Promise.all([
+      supabase.from('proveedores')
+        .select('*, pagos_proveedores(id, importe)')
+        .order('nombre'),
+      supabase.from('cuentas_bancarias').select('*').order('banco'),
+    ])
+
+    const rows = (provRes.data || []).map(p => ({
+      ...p,
+      total_pagos: (p.pagos_proveedores || []).length,
+      total_pagado: (p.pagos_proveedores || []).reduce((s, pp) => s + Number(pp.importe), 0),
+    }))
+    setProveedores(rows)
+    setCuentas(cuentasRes.data || [])
+  }
+
+  async function loadProveedores() {
+    const { data } = await supabase
+      .from('proveedores')
+      .select('*, pagos_proveedores(id, importe)')
+      .order('nombre')
+
+    const rows = (data || []).map(p => ({
+      ...p,
+      total_pagos: (p.pagos_proveedores || []).length,
+      total_pagado: (p.pagos_proveedores || []).reduce((s, pp) => s + Number(pp.importe), 0),
+    }))
     setProveedores(rows)
   }
 
-  function openDetalle(p) {
+  async function openDetalle(p) {
     setDetalle(p)
-    const h = query(`
-      SELECT pp.*, cb.banco, cb.ultimos_4
-      FROM pagos_proveedores pp
-      LEFT JOIN cuentas_bancarias cb ON cb.id = pp.cuenta_bancaria_id
-      WHERE pp.proveedor_id = ? ORDER BY pp.fecha DESC
-    `, [p.id])
-    setPagos(h)
+    const { data } = await supabase
+      .from('pagos_proveedores')
+      .select('*, cuentas_bancarias(banco, ultimos_4)')
+      .eq('proveedor_id', p.id)
+      .order('fecha', { ascending: false })
+
+    setPagos((data || []).map(pp => ({
+      ...pp,
+      banco: pp.cuentas_bancarias?.banco || null,
+      ultimos_4: pp.cuentas_bancarias?.ultimos_4 || null,
+    })))
   }
 
   const filtered = proveedores.filter(p =>
@@ -64,33 +84,47 @@ export default function Proveedores() {
     setEditando(p.id); setErrors({}); setModal(true)
   }
 
-  function handleSave() {
+  async function handleSave() {
     const e = {}
     if (!form.nombre.trim()) e.nombre = 'Nombre requerido'
     if (!form.tipo_servicio.trim()) e.tipo_servicio = 'Tipo de servicio requerido'
     setErrors(e)
     if (Object.keys(e).length) return
+    const payload = {
+      nombre: form.nombre, tipo_servicio: form.tipo_servicio,
+      telefono: form.telefono, email: form.email, rfc: form.rfc, notas: form.notas
+    }
     if (editando) {
-      run(`UPDATE proveedores SET nombre=?, tipo_servicio=?, telefono=?, email=?, rfc=?, notas=? WHERE id=?`,
-        [form.nombre, form.tipo_servicio, form.telefono, form.email, form.rfc, form.notas, editando])
+      await supabase.from('proveedores').update(payload).eq('id', editando)
     } else {
-      run(`INSERT INTO proveedores (nombre, tipo_servicio, telefono, email, rfc, notas) VALUES (?,?,?,?,?,?)`,
-        [form.nombre, form.tipo_servicio, form.telefono, form.email, form.rfc, form.notas])
+      await supabase.from('proveedores').insert(payload)
     }
     setModal(false); loadProveedores()
   }
 
-  function savePago() {
+  async function savePago() {
     const e = {}
     if (!pagoForm.fecha) e.fecha = 'Requerida'
     if (!pagoForm.concepto.trim()) e.concepto = 'Requerido'
     if (!pagoForm.importe || Number(pagoForm.importe) <= 0) e.importe = 'Inválido'
-    setPagoModal(e)
+    setErrors(e)
     if (Object.keys(e).length) return
-    run(`INSERT INTO pagos_proveedores (proveedor_id, fecha, concepto, importe, cuenta_bancaria_id, referencia) VALUES (?,?,?,?,?,?)`,
-      [detalle.id, pagoForm.fecha, pagoForm.concepto, Number(pagoForm.importe), pagoForm.cuenta_bancaria_id||null, pagoForm.referencia])
+
+    await supabase.from('pagos_proveedores').insert({
+      proveedor_id: detalle.id,
+      fecha: pagoForm.fecha,
+      concepto: pagoForm.concepto,
+      importe: Number(pagoForm.importe),
+      cuenta_bancaria_id: pagoForm.cuenta_bancaria_id || null,
+      referencia: pagoForm.referencia,
+    })
     if (pagoForm.cuenta_bancaria_id) {
-      run(`UPDATE cuentas_bancarias SET saldo_actual = saldo_actual - ? WHERE id=?`, [Number(pagoForm.importe), pagoForm.cuenta_bancaria_id])
+      const cuenta = cuentas.find(c => c.id == pagoForm.cuenta_bancaria_id)
+      if (cuenta) {
+        await supabase.from('cuentas_bancarias')
+          .update({ saldo_actual: cuenta.saldo_actual - Number(pagoForm.importe) })
+          .eq('id', cuenta.id)
+      }
     }
     setPagoModal(false)
     openDetalle(detalle)
@@ -159,7 +193,7 @@ export default function Proveedores() {
                   </div>
                 </div>
                 <Btn size="sm" variant="secondary" icon={<DollarSign size={12}/>}
-                  onClick={() => { setPagoForm(EMPTY_PAGO); setPagoModal(true) }}
+                  onClick={() => { setPagoForm(EMPTY_PAGO); setErrors({}); setPagoModal(true) }}
                   style={{ width: '100%', marginBottom: 12 }}>
                   Registrar Pago
                 </Btn>
@@ -204,9 +238,9 @@ export default function Proveedores() {
 
       <Modal open={pagoModal} onClose={() => setPagoModal(false)} title={`Pago a ${detalle?.nombre}`} width={420}>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
-          <FormField label="Fecha" required><Input type="date" value={pagoForm.fecha} onChange={e => fp('fecha', e.target.value)} /></FormField>
-          <FormField label="Concepto" required><Input value={pagoForm.concepto} onChange={e => fp('concepto', e.target.value)} /></FormField>
-          <FormField label="Importe (MXN)" required><Input type="number" min="0.01" value={pagoForm.importe} onChange={e => fp('importe', e.target.value)} /></FormField>
+          <FormField label="Fecha" required error={errors.fecha}><Input type="date" value={pagoForm.fecha} onChange={e => fp('fecha', e.target.value)} /></FormField>
+          <FormField label="Concepto" required error={errors.concepto}><Input value={pagoForm.concepto} onChange={e => fp('concepto', e.target.value)} /></FormField>
+          <FormField label="Importe (MXN)" required error={errors.importe}><Input type="number" min="0.01" value={pagoForm.importe} onChange={e => fp('importe', e.target.value)} /></FormField>
           <FormField label="Cuenta de origen">
             <Select value={pagoForm.cuenta_bancaria_id} onChange={e => fp('cuenta_bancaria_id', e.target.value)}>
               <option value="">— Seleccionar —</option>

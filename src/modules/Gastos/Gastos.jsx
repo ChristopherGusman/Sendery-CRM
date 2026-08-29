@@ -1,11 +1,11 @@
 import React, { useState, useEffect } from 'react'
-import { query, run } from '../../db/database.js'
+import { supabase } from '../../lib/supabase.js'
 import { formatMXN, formatDate, today } from '../../utils/format.js'
 import {
   PageHeader, PageContent, Card, Btn, Badge, Table, TR, TD,
   Modal, FormField, Input, Select, Textarea, SearchBar
 } from '../../components/Layout.jsx'
-import { Plus, Trash2, Filter } from 'lucide-react'
+import { Plus, Trash2 } from 'lucide-react'
 
 const CATEGORIAS = ['transporte','alimentación','hospedaje','equipo','marketing','otro']
 const CAT_COLORS = {
@@ -36,23 +36,45 @@ export default function Gastos() {
   const [proveedores, setProveedores] = useState([])
   const [cuentas, setCuentas] = useState([])
 
-  useEffect(() => {
-    loadGastos()
-    setEventos(query(`SELECT id, nombre FROM eventos ORDER BY fecha DESC`))
-    setProveedores(query(`SELECT id, nombre FROM proveedores ORDER BY nombre`))
-    setCuentas(query(`SELECT * FROM cuentas_bancarias ORDER BY banco`))
-  }, [])
+  useEffect(() => { loadAll() }, [])
 
-  function loadGastos() {
-    const rows = query(`
-      SELECT g.*, e.nombre as evento_nombre, pr.nombre as proveedor_nombre,
-        cb.banco, cb.ultimos_4
-      FROM gastos g
-      LEFT JOIN eventos e ON e.id = g.evento_id
-      LEFT JOIN proveedores pr ON pr.id = g.proveedor_id
-      LEFT JOIN cuentas_bancarias cb ON cb.id = g.cuenta_bancaria_id
-      ORDER BY g.fecha DESC, g.id DESC
-    `)
+  async function loadAll() {
+    const [gastosRes, eventosRes, provRes, cuentasRes] = await Promise.all([
+      supabase.from('gastos')
+        .select('*, eventos(nombre), proveedores(nombre), cuentas_bancarias(banco, ultimos_4)')
+        .order('fecha', { ascending: false })
+        .order('id', { ascending: false }),
+      supabase.from('eventos').select('id, nombre').order('fecha', { ascending: false }),
+      supabase.from('proveedores').select('id, nombre').order('nombre'),
+      supabase.from('cuentas_bancarias').select('*').order('banco'),
+    ])
+
+    const rows = (gastosRes.data || []).map(g => ({
+      ...g,
+      evento_nombre: g.eventos?.nombre || null,
+      proveedor_nombre: g.proveedores?.nombre || null,
+      banco: g.cuentas_bancarias?.banco || null,
+      ultimos_4: g.cuentas_bancarias?.ultimos_4 || null,
+    }))
+    setGastos(rows)
+    setEventos(eventosRes.data || [])
+    setProveedores(provRes.data || [])
+    setCuentas(cuentasRes.data || [])
+  }
+
+  async function loadGastos() {
+    const { data } = await supabase.from('gastos')
+      .select('*, eventos(nombre), proveedores(nombre), cuentas_bancarias(banco, ultimos_4)')
+      .order('fecha', { ascending: false })
+      .order('id', { ascending: false })
+
+    const rows = (data || []).map(g => ({
+      ...g,
+      evento_nombre: g.eventos?.nombre || null,
+      proveedor_nombre: g.proveedores?.nombre || null,
+      banco: g.cuentas_bancarias?.banco || null,
+      ultimos_4: g.cuentas_bancarias?.ultimos_4 || null,
+    }))
     setGastos(rows)
   }
 
@@ -88,36 +110,41 @@ export default function Gastos() {
     return Object.keys(e).length === 0
   }
 
-  function handleSave() {
+  async function handleSave() {
     if (!validate()) return
+    const payload = {
+      fecha: form.fecha, concepto: form.concepto, categoria: form.categoria,
+      importe: Number(form.importe), moneda: form.moneda, ubicacion: form.ubicacion,
+      evento_id: form.evento_id || null, proveedor_id: form.proveedor_id || null,
+      cuenta_bancaria_id: form.cuenta_bancaria_id || null, comprobante: form.comprobante
+    }
     if (editando) {
-      run(`UPDATE gastos SET fecha=?, concepto=?, categoria=?, importe=?, moneda=?,
-        ubicacion=?, evento_id=?, proveedor_id=?, cuenta_bancaria_id=?, comprobante=? WHERE id=?`, [
-        form.fecha, form.concepto, form.categoria, Number(form.importe), form.moneda,
-        form.ubicacion, form.evento_id||null, form.proveedor_id||null,
-        form.cuenta_bancaria_id||null, form.comprobante, editando
-      ])
+      await supabase.from('gastos').update(payload).eq('id', editando)
     } else {
-      run(`INSERT INTO gastos (fecha, concepto, categoria, importe, moneda, ubicacion,
-        evento_id, proveedor_id, cuenta_bancaria_id, comprobante) VALUES (?,?,?,?,?,?,?,?,?,?)`, [
-        form.fecha, form.concepto, form.categoria, Number(form.importe), form.moneda,
-        form.ubicacion, form.evento_id||null, form.proveedor_id||null,
-        form.cuenta_bancaria_id||null, form.comprobante
-      ])
-      // Afectar saldo bancario
+      await supabase.from('gastos').insert(payload)
       if (form.cuenta_bancaria_id) {
-        run(`UPDATE cuentas_bancarias SET saldo_actual = saldo_actual - ? WHERE id=?`,
-          [Number(form.importe), form.cuenta_bancaria_id])
-        run(`INSERT INTO movimientos (cuenta_id, fecha, tipo, concepto, importe, evento_id) VALUES (?,?,?,?,?,?)`,
-          [form.cuenta_bancaria_id, form.fecha, 'egreso', form.concepto, Number(form.importe), form.evento_id||null])
+        const cuenta = cuentas.find(c => c.id == form.cuenta_bancaria_id)
+        if (cuenta) {
+          await supabase.from('cuentas_bancarias')
+            .update({ saldo_actual: cuenta.saldo_actual - Number(form.importe) })
+            .eq('id', cuenta.id)
+          await supabase.from('movimientos').insert({
+            cuenta_id: Number(form.cuenta_bancaria_id),
+            fecha: form.fecha,
+            tipo: 'egreso',
+            concepto: form.concepto,
+            importe: Number(form.importe),
+            evento_id: form.evento_id || null,
+          })
+        }
       }
     }
     setModal(false); loadGastos()
   }
 
-  function deleteGasto(g) {
+  async function deleteGasto(g) {
     if (!confirm('¿Eliminar este gasto?')) return
-    run(`DELETE FROM gastos WHERE id=?`, [g.id])
+    await supabase.from('gastos').delete().eq('id', g.id)
     loadGastos()
   }
 
