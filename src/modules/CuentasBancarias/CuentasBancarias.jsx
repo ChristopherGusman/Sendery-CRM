@@ -19,6 +19,9 @@ export default function CuentasBancarias() {
   const [editando, setEditando] = useState(null)
   const [form, setForm] = useState(EMPTY)
   const [errors, setErrors] = useState({})
+  // Candado contra doble clic: dos clics seguidos en el botón de guardar
+  // insertaban el registro dos veces.
+  const [saving, setSaving] = useState(false)
   const [movModal, setMovModal] = useState(false)
   const [movForm, setMovForm] = useState(EMPTY_MOV)
   const [eventos, setEventos] = useState([])
@@ -90,6 +93,7 @@ export default function CuentasBancarias() {
   }
 
   async function handleSave() {
+    if (saving) return
     const e = {}
     if (!form.banco.trim()) e.banco = 'Banco requerido'
     if (!form.titular.trim()) e.titular = 'Titular requerido'
@@ -100,15 +104,20 @@ export default function CuentasBancarias() {
       banco: form.banco, ultimos_4: form.ultimos_4, titular: form.titular,
       tipo: form.tipo, saldo_actual: Number(form.saldo_actual) || 0
     }
-    if (editando) {
-      await supabase.from('cuentas_bancarias').update(payload).eq('id', editando)
-    } else {
-      await supabase.from('cuentas_bancarias').insert(payload)
+    setSaving(true)
+    try {
+      const { error } = editando
+        ? await supabase.from('cuentas_bancarias').update(payload).eq('id', editando)
+        : await supabase.from('cuentas_bancarias').insert(payload)
+      if (error) { alert(`No se pudo guardar: ${error.message}`); return }
+      setModal(false); loadCuentas()
+    } finally {
+      setSaving(false)
     }
-    setModal(false); loadCuentas()
   }
 
   async function saveMov() {
+    if (saving) return
     const e = {}
     if (!movForm.fecha) e.fecha = 'Requerida'
     if (!movForm.concepto.trim()) e.concepto = 'Requerido'
@@ -116,24 +125,41 @@ export default function CuentasBancarias() {
     setErrors(e)
     if (Object.keys(e).length) return
 
-    const monto = Number(movForm.importe)
-    await supabase.from('movimientos').insert({
-      cuenta_id: seleccionada.id,
-      fecha: movForm.fecha,
-      tipo: movForm.tipo,
-      concepto: movForm.concepto,
-      importe: monto,
-      referencia: movForm.referencia,
-      evento_id: movForm.evento_id || null,
-    })
-    const delta = movForm.tipo === 'ingreso' ? monto : -monto
-    await supabase.from('cuentas_bancarias')
-      .update({ saldo_actual: seleccionada.saldo_actual + delta })
-      .eq('id', seleccionada.id)
+    setSaving(true)
+    try {
+      const monto = Number(movForm.importe)
+      // Referencia vacía se guarda como NULL: el índice único de
+      // movimientos(referencia) trata cada NULL como distinto, mientras que
+      // varias cadenas vacías chocarían entre sí.
+      const { error } = await supabase.from('movimientos').insert({
+        cuenta_id: seleccionada.id,
+        fecha: movForm.fecha,
+        tipo: movForm.tipo,
+        concepto: movForm.concepto,
+        importe: monto,
+        referencia: (movForm.referencia || '').trim() || null,
+        evento_id: movForm.evento_id || null,
+      })
+      if (error) {
+        alert(error.code === '23505'
+          ? `Ya existe un movimiento con la referencia "${movForm.referencia}". No se registró de nuevo.`
+          : `No se pudo registrar el movimiento: ${error.message}`)
+        return
+      }
+      const delta = movForm.tipo === 'ingreso' ? monto : -monto
+      // Saldo tomado de la base, no del valor que traía la pantalla.
+      const { data: cAct } = await supabase
+        .from('cuentas_bancarias').select('saldo_actual').eq('id', seleccionada.id).single()
+      await supabase.from('cuentas_bancarias')
+        .update({ saldo_actual: Number(cAct?.saldo_actual || 0) + delta })
+        .eq('id', seleccionada.id)
 
-    setMovModal(false)
-    loadCuentas()
-    loadMovimientos(seleccionada.id)
+      setMovModal(false)
+      loadCuentas()
+      loadMovimientos(seleccionada.id)
+    } finally {
+      setSaving(false)
+    }
   }
 
   const f = (k, v) => setForm(p => ({ ...p, [k]: v }))
@@ -289,7 +315,9 @@ export default function CuentasBancarias() {
         </div>
         <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end', marginTop: 20 }}>
           <Btn variant="outline" onClick={() => setModal(false)}>Cancelar</Btn>
-          <Btn onClick={handleSave}>{editando ? 'Guardar' : 'Crear Cuenta'}</Btn>
+          <Btn onClick={handleSave} disabled={saving}>
+            {saving ? 'Guardando...' : editando ? 'Guardar' : 'Crear Cuenta'}
+          </Btn>
         </div>
       </Modal>
 
@@ -315,7 +343,9 @@ export default function CuentasBancarias() {
         </div>
         <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end', marginTop: 20 }}>
           <Btn variant="outline" onClick={() => setMovModal(false)}>Cancelar</Btn>
-          <Btn onClick={saveMov} variant="secondary">Registrar</Btn>
+          <Btn onClick={saveMov} variant="secondary" disabled={saving}>
+            {saving ? 'Registrando...' : 'Registrar'}
+          </Btn>
         </div>
       </Modal>
     </div>

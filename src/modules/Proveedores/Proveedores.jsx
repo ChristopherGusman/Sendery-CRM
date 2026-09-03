@@ -17,6 +17,9 @@ export default function Proveedores() {
   const [editando, setEditando] = useState(null)
   const [form, setForm] = useState(EMPTY)
   const [errors, setErrors] = useState({})
+  // Candado contra doble clic: dos clics seguidos en el botón de guardar
+  // insertaban el registro dos veces.
+  const [saving, setSaving] = useState(false)
   const [detalle, setDetalle] = useState(null)
   const [pagos, setPagos] = useState([])
   const [pagoModal, setPagoModal] = useState(false)
@@ -85,6 +88,7 @@ export default function Proveedores() {
   }
 
   async function handleSave() {
+    if (saving) return
     const e = {}
     if (!form.nombre.trim()) e.nombre = 'Nombre requerido'
     if (!form.tipo_servicio.trim()) e.tipo_servicio = 'Tipo de servicio requerido'
@@ -94,15 +98,20 @@ export default function Proveedores() {
       nombre: form.nombre, tipo_servicio: form.tipo_servicio,
       telefono: form.telefono, email: form.email, rfc: form.rfc, notas: form.notas
     }
-    if (editando) {
-      await supabase.from('proveedores').update(payload).eq('id', editando)
-    } else {
-      await supabase.from('proveedores').insert(payload)
+    setSaving(true)
+    try {
+      const { error } = editando
+        ? await supabase.from('proveedores').update(payload).eq('id', editando)
+        : await supabase.from('proveedores').insert(payload)
+      if (error) { alert(`No se pudo guardar: ${error.message}`); return }
+      setModal(false); loadProveedores()
+    } finally {
+      setSaving(false)
     }
-    setModal(false); loadProveedores()
   }
 
   async function savePago() {
+    if (saving) return
     const e = {}
     if (!pagoForm.fecha) e.fecha = 'Requerida'
     if (!pagoForm.concepto.trim()) e.concepto = 'Requerido'
@@ -110,25 +119,34 @@ export default function Proveedores() {
     setErrors(e)
     if (Object.keys(e).length) return
 
-    await supabase.from('pagos_proveedores').insert({
-      proveedor_id: detalle.id,
-      fecha: pagoForm.fecha,
-      concepto: pagoForm.concepto,
-      importe: Number(pagoForm.importe),
-      cuenta_bancaria_id: pagoForm.cuenta_bancaria_id || null,
-      referencia: pagoForm.referencia,
-    })
-    if (pagoForm.cuenta_bancaria_id) {
-      const cuenta = cuentas.find(c => c.id == pagoForm.cuenta_bancaria_id)
-      if (cuenta) {
-        await supabase.from('cuentas_bancarias')
-          .update({ saldo_actual: cuenta.saldo_actual - Number(pagoForm.importe) })
-          .eq('id', cuenta.id)
+    setSaving(true)
+    try {
+      const { error } = await supabase.from('pagos_proveedores').insert({
+        proveedor_id: detalle.id,
+        fecha: pagoForm.fecha,
+        concepto: pagoForm.concepto,
+        importe: Number(pagoForm.importe),
+        cuenta_bancaria_id: pagoForm.cuenta_bancaria_id || null,
+        referencia: pagoForm.referencia,
+      })
+      if (error) { alert(`No se pudo registrar el pago: ${error.message}`); return }
+      if (pagoForm.cuenta_bancaria_id) {
+        const cuenta = cuentas.find(c => c.id == pagoForm.cuenta_bancaria_id)
+        if (cuenta) {
+          // Saldo tomado de la base, no del valor que traía la pantalla.
+          const { data: cAct } = await supabase
+            .from('cuentas_bancarias').select('saldo_actual').eq('id', cuenta.id).single()
+          await supabase.from('cuentas_bancarias')
+            .update({ saldo_actual: Number(cAct?.saldo_actual || 0) - Number(pagoForm.importe) })
+            .eq('id', cuenta.id)
+        }
       }
+      setPagoModal(false)
+      openDetalle(detalle)
+      loadProveedores()
+    } finally {
+      setSaving(false)
     }
-    setPagoModal(false)
-    openDetalle(detalle)
-    loadProveedores()
   }
 
   const f = (k, v) => setForm(p => ({ ...p, [k]: v }))
@@ -232,7 +250,9 @@ export default function Proveedores() {
         </div>
         <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end', marginTop: 20 }}>
           <Btn variant="outline" onClick={() => setModal(false)}>Cancelar</Btn>
-          <Btn onClick={handleSave}>{editando ? 'Guardar' : 'Crear'}</Btn>
+          <Btn onClick={handleSave} disabled={saving}>
+            {saving ? 'Guardando...' : editando ? 'Guardar' : 'Crear'}
+          </Btn>
         </div>
       </Modal>
 
@@ -251,7 +271,9 @@ export default function Proveedores() {
         </div>
         <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end', marginTop: 20 }}>
           <Btn variant="outline" onClick={() => setPagoModal(false)}>Cancelar</Btn>
-          <Btn onClick={savePago} variant="secondary">Registrar Pago</Btn>
+          <Btn onClick={savePago} variant="secondary" disabled={saving}>
+            {saving ? 'Registrando...' : 'Registrar Pago'}
+          </Btn>
         </div>
       </Modal>
     </div>

@@ -157,9 +157,20 @@ async function findOrCreateParticipante(clienteId, clienteNombre, eventoId) {
   return ins.id
 }
 
+// Deja constancia de que el folio ya fue importado. Es el candado que
+// impide que una segunda importación del mismo archivo vuelva a insertar
+// los mismos abonos y gastos.
+async function marcarFolioImportado(folio, tipo, eventoId) {
+  await supabase.from('excel_imports_log').upsert(
+    { folio, tipo: String(tipo).toLowerCase(), evento_id: eventoId },
+    { onConflict: 'folio', ignoreDuplicates: true }
+  )
+}
+
 // ── Componente principal ────────────────────────────────────────
 export default function Importador() {
   const fileInputRef = useRef(null)
+  const importingRef = useRef(false)
   const [step, setStep] = useState('idle')
   const [fileName, setFileName] = useState('')
   const [allRows, setAllRows] = useState([])
@@ -256,12 +267,32 @@ export default function Importador() {
   }
 
   // ── Ejecutar importación ────────────────────────────────────
+  // Candado contra doble clic / doble disparo: sin esto, dos clics en
+  // "Importar" lanzaban dos recorridos simultáneos sobre el mismo archivo
+  // y cada fila se insertaba dos veces.
   const runImport = async () => {
+    if (importingRef.current) return
+    importingRef.current = true
+    try {
+      await runImportInner()
+    } catch (err) {
+      setImportErrors([`Error durante la importación: ${err.message}`])
+      setStep('error')
+    } finally {
+      importingRef.current = false
+    }
+  }
+
+  const runImportInner = async () => {
     setStep('importing')
-    await supabase.from('excel_imports_log').delete().neq('folio', '')
+    // NO se borra excel_imports_log aquí. Antes se borraba en cada corrida,
+    // lo que anulaba por completo el control de folios ya importados: volver
+    // a subir el mismo Excel duplicaba abonos y gastos, inflaba
+    // monto_total_acordado y descuadraba los saldos de las cuentas.
+    // Para reimportar a propósito está el botón "Limpiar historial".
     resetCache()
 
-    const stats = { clientes: 0, eventos: 0, abonos: 0, gastos: 0, omitidos: 0 }
+    const stats = { clientes: 0, eventos: 0, abonos: 0, gastos: 0, omitidos: 0, duplicados: 0 }
     const errors = []
     const tiposDesconocidos = new Set()
     const total = allRows.length
@@ -317,7 +348,7 @@ export default function Importador() {
 
         const { data: yaExiste } = await supabase
           .from('excel_imports_log').select('folio').eq('folio', folio).limit(1)
-        if (yaExiste?.length) { stats.omitidos++; continue }
+        if (yaExiste?.length) { stats.duplicados++; continue }
 
         const cuentaId = await findOrCreateCuenta(cuenta)
         const eventoId = evento ? await findOrCreateEvento(cev, evento, fEvento) : null
@@ -327,10 +358,23 @@ export default function Importador() {
           const clienteId = await findOrCreateCliente(nombre)
           const partId = await findOrCreateParticipante(clienteId, nombre, eventoId)
 
-          await supabase.from('abonos').insert({
-            participante_id: partId, evento_id: eventoId, cliente_id: clienteId,
-            fecha, monto: montoAbs, referencia: folio, cuenta_destino: cuenta
-          })
+          // Idempotente por folio: si ya existe un abono con esta referencia
+          // no se inserta otro y `insAbono` vuelve vacío. Así, aunque se
+          // pierda el historial de importación, reimportar el mismo archivo
+          // no duplica abonos ni infla el saldo de la cuenta.
+          const { data: insAbono, error: errAbono } = await supabase
+            .from('abonos')
+            .upsert({
+              participante_id: partId, evento_id: eventoId, cliente_id: clienteId,
+              fecha, monto: montoAbs, referencia: folio, cuenta_destino: cuenta
+            }, { onConflict: 'referencia', ignoreDuplicates: true })
+            .select('id')
+          if (errAbono) throw errAbono
+          if (!insAbono?.length) {
+            stats.duplicados++
+            await marcarFolioImportado(folio, tipo, eventoId)
+            continue
+          }
 
           // Acumular monto_total_acordado en participante
           const { data: partData } = await supabase
@@ -341,11 +385,12 @@ export default function Importador() {
           }).eq('id', partId)
 
           // Movimiento bancario (ignorar duplicados por referencia)
-          await supabase.from('movimientos').upsert({
+          const { error: errMovIn } = await supabase.from('movimientos').upsert({
             cuenta_id: cuentaId, fecha, tipo: 'ingreso',
             concepto: `${nombre} — ${evento}`.slice(0, 100),
             importe: montoAbs, referencia: folio, evento_id: eventoId
           }, { onConflict: 'referencia', ignoreDuplicates: true })
+          if (errMovIn) throw errMovIn
 
           // Actualizar saldo cuenta
           const { data: cuentaData } = await supabase
@@ -358,17 +403,28 @@ export default function Importador() {
 
         } else if (tipo === 'GASTO' && eventoId) {
           const importe = Math.abs(monto)
-          await supabase.from('gastos').insert({
-            fecha, concepto: (nombre || `Gasto ${cev}`).slice(0, 120),
-            categoria: 'otro', importe, moneda: 'MXN',
-            evento_id: eventoId, cuenta_bancaria_id: cuentaId, comprobante: folio
-          })
+          // Idempotente por comprobante (mismo criterio que abonos).
+          const { data: insGasto, error: errGasto } = await supabase
+            .from('gastos')
+            .upsert({
+              fecha, concepto: (nombre || `Gasto ${cev}`).slice(0, 120),
+              categoria: 'otro', importe, moneda: 'MXN',
+              evento_id: eventoId, cuenta_bancaria_id: cuentaId, comprobante: folio
+            }, { onConflict: 'comprobante', ignoreDuplicates: true })
+            .select('id')
+          if (errGasto) throw errGasto
+          if (!insGasto?.length) {
+            stats.duplicados++
+            await marcarFolioImportado(folio, tipo, eventoId)
+            continue
+          }
 
-          await supabase.from('movimientos').upsert({
+          const { error: errMovOut } = await supabase.from('movimientos').upsert({
             cuenta_id: cuentaId, fecha, tipo: 'egreso',
             concepto: (nombre || `Gasto ${cev}`).slice(0, 100),
             importe, referencia: folio, evento_id: eventoId
           }, { onConflict: 'referencia', ignoreDuplicates: true })
+          if (errMovOut) throw errMovOut
 
           const { data: cuentaData } = await supabase
             .from('cuentas_bancarias').select('saldo_actual').eq('id', cuentaId).single()
@@ -383,10 +439,7 @@ export default function Importador() {
           continue
         }
 
-        await supabase.from('excel_imports_log').upsert(
-          { folio, tipo: tipo.toLowerCase(), evento_id: eventoId },
-          { onConflict: 'folio', ignoreDuplicates: true }
-        )
+        await marcarFolioImportado(folio, tipo, eventoId)
 
       } catch (err) {
         errors.push(`Fila ${i + 2}: ${err.message}`)
@@ -655,6 +708,7 @@ export default function Importador() {
                 { label: 'Abonos registrados', val: results.abonos, bg: '#EAF0D8', color: '#2C3A1A', icon: '💰' },
                 { label: 'Gastos registrados', val: results.gastos, bg: '#FCECEA', color: '#8B1A1A', icon: '📤' },
                 { label: 'Registros omitidos', val: results.omitidos, bg: '#F5F5F5', color: '#555', icon: '⏭️' },
+                { label: 'Duplicados evitados', val: results.duplicados ?? 0, bg: '#FFF3CC', color: '#7A5A00', icon: '🛡️' },
               ].map(({ label, val, bg, color, icon }) => (
                 <div key={label} style={{ background: bg, borderRadius: 12, padding: '18px 20px', display: 'flex', alignItems: 'center', gap: 14 }}>
                   <div style={{ fontSize: 28 }}>{icon}</div>

@@ -23,6 +23,9 @@ export default function EventosList() {
   const [editando, setEditando] = useState(null)
   const [form, setForm] = useState(EMPTY_FORM)
   const [errors, setErrors] = useState({})
+  // Candado contra doble clic: dos clics seguidos en el botón de guardar
+  // insertaban el registro dos veces.
+  const [saving, setSaving] = useState(false)
 
   useEffect(() => { loadEventos() }, [])
 
@@ -71,19 +74,23 @@ export default function EventosList() {
   }
 
   async function handleSave() {
-    if (!validate()) return
+    if (saving || !validate()) return
     const payload = {
       nombre: form.nombre, tipo: form.tipo, fecha: form.fecha, lugar: form.lugar,
       ejecutor: form.ejecutor, costo_total: Number(form.costo_total) || 0,
       cupo_maximo: Number(form.cupo_maximo) || 0, estado: form.estado, notas: form.notas
     }
-    if (editando) {
-      await supabase.from('eventos').update(payload).eq('id', editando)
-    } else {
-      await supabase.from('eventos').insert(payload)
+    setSaving(true)
+    try {
+      const { error } = editando
+        ? await supabase.from('eventos').update(payload).eq('id', editando)
+        : await supabase.from('eventos').insert(payload)
+      if (error) { alert(`No se pudo guardar: ${error.message}`); return }
+      setModalOpen(false)
+      loadEventos()
+    } finally {
+      setSaving(false)
     }
-    setModalOpen(false)
-    loadEventos()
   }
 
   const f = (k, v) => setForm(p => ({ ...p, [k]: v }))
@@ -222,7 +229,9 @@ export default function EventosList() {
         </div>
         <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end', marginTop: 20 }}>
           <Btn variant="outline" onClick={() => setModalOpen(false)}>Cancelar</Btn>
-          <Btn onClick={handleSave}>{editando ? 'Guardar Cambios' : 'Crear Evento'}</Btn>
+          <Btn onClick={handleSave} disabled={saving}>
+            {saving ? 'Guardando...' : editando ? 'Guardar Cambios' : 'Crear Evento'}
+          </Btn>
         </div>
       </Modal>
     </div>

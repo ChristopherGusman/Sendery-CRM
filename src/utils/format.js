@@ -42,14 +42,26 @@ export function getEventoStatus(estado) {
 }
 
 // ── Folio único ─────────────────────────────────────────────────
+// La versión anterior solo tenía precisión de MINUTO: dos recibos (o dos
+// abonos) generados dentro del mismo minuto salían con el MISMO folio.
+// Eso hacía que dos documentos distintos parecieran el mismo recibo, y que
+// el movimiento bancario del segundo abono se perdiera al chocar con el
+// índice único movimientos(referencia).
+// Ahora: segundos + contador + sufijo aleatorio.
+let _folioSeq = 0
 export function generateFolio(prefix = 'SND') {
   const now = new Date()
+  const p2 = n => String(n).padStart(2, '0')
   const ts = now.getFullYear().toString().slice(-2) +
-    String(now.getMonth()+1).padStart(2,'0') +
-    String(now.getDate()).padStart(2,'0') +
-    String(now.getHours()).padStart(2,'0') +
-    String(now.getMinutes()).padStart(2,'0')
-  return `${prefix}-${ts}`
+    p2(now.getMonth() + 1) +
+    p2(now.getDate()) +
+    p2(now.getHours()) +
+    p2(now.getMinutes()) +
+    p2(now.getSeconds())
+  _folioSeq = (_folioSeq + 1) % 36
+  const suf = _folioSeq.toString(36).toUpperCase() +
+    Math.random().toString(36).slice(2, 5).toUpperCase()
+  return `${prefix}-${ts}-${suf}`
 }
 
 // ── Hoy en formato YYYY-MM-DD ───────────────────────────────────

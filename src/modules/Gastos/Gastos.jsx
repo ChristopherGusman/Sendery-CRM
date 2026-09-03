@@ -32,6 +32,9 @@ export default function Gastos() {
   const [editando, setEditando] = useState(null)
   const [form, setForm] = useState(EMPTY)
   const [errors, setErrors] = useState({})
+  // Candado contra doble clic: dos clics seguidos en el botón de guardar
+  // insertaban el registro dos veces.
+  const [saving, setSaving] = useState(false)
   const [eventos, setEventos] = useState([])
   const [proveedores, setProveedores] = useState([])
   const [cuentas, setCuentas] = useState([])
@@ -111,35 +114,57 @@ export default function Gastos() {
   }
 
   async function handleSave() {
-    if (!validate()) return
+    if (saving || !validate()) return
     const payload = {
       fecha: form.fecha, concepto: form.concepto, categoria: form.categoria,
       importe: Number(form.importe), moneda: form.moneda, ubicacion: form.ubicacion,
       evento_id: form.evento_id || null, proveedor_id: form.proveedor_id || null,
-      cuenta_bancaria_id: form.cuenta_bancaria_id || null, comprobante: form.comprobante
+      cuenta_bancaria_id: form.cuenta_bancaria_id || null,
+      // Comprobante vacío se guarda como NULL: el índice único de
+      // gastos(comprobante) trata cada NULL como distinto, mientras que
+      // varias cadenas vacías chocarían entre sí.
+      comprobante: (form.comprobante || '').trim() || null
     }
-    if (editando) {
-      await supabase.from('gastos').update(payload).eq('id', editando)
-    } else {
-      await supabase.from('gastos').insert(payload)
-      if (form.cuenta_bancaria_id) {
-        const cuenta = cuentas.find(c => c.id == form.cuenta_bancaria_id)
-        if (cuenta) {
-          await supabase.from('cuentas_bancarias')
-            .update({ saldo_actual: cuenta.saldo_actual - Number(form.importe) })
-            .eq('id', cuenta.id)
-          await supabase.from('movimientos').insert({
-            cuenta_id: Number(form.cuenta_bancaria_id),
-            fecha: form.fecha,
-            tipo: 'egreso',
-            concepto: form.concepto,
-            importe: Number(form.importe),
-            evento_id: form.evento_id || null,
-          })
+    setSaving(true)
+    try {
+      if (editando) {
+        const { error } = await supabase.from('gastos').update(payload).eq('id', editando)
+        if (error) { alert(`No se pudo guardar: ${error.message}`); return }
+      } else {
+        const { error } = await supabase.from('gastos').insert(payload)
+        if (error) {
+          alert(error.code === '23505'
+            ? `Ya existe un gasto con el comprobante "${form.comprobante}". No se registró de nuevo.`
+            : `No se pudo guardar: ${error.message}`)
+          return
+        }
+        if (form.cuenta_bancaria_id) {
+          const cuenta = cuentas.find(c => c.id == form.cuenta_bancaria_id)
+          if (cuenta) {
+            const { error: errMov } = await supabase.from('movimientos').insert({
+              cuenta_id: Number(form.cuenta_bancaria_id),
+              fecha: form.fecha,
+              tipo: 'egreso',
+              concepto: form.concepto,
+              importe: Number(form.importe),
+              referencia: form.comprobante || null,
+              evento_id: form.evento_id || null,
+            })
+            // El saldo solo se mueve si el movimiento entró de verdad.
+            if (!errMov) {
+              const { data: cAct } = await supabase
+                .from('cuentas_bancarias').select('saldo_actual').eq('id', cuenta.id).single()
+              await supabase.from('cuentas_bancarias')
+                .update({ saldo_actual: Number(cAct?.saldo_actual || 0) - Number(form.importe) })
+                .eq('id', cuenta.id)
+            }
+          }
         }
       }
+      setModal(false); loadGastos()
+    } finally {
+      setSaving(false)
     }
-    setModal(false); loadGastos()
   }
 
   async function deleteGasto(g) {
@@ -289,7 +314,9 @@ export default function Gastos() {
         </div>
         <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end', marginTop: 20 }}>
           <Btn variant="outline" onClick={() => setModal(false)}>Cancelar</Btn>
-          <Btn onClick={handleSave}>{editando ? 'Guardar' : 'Registrar'}</Btn>
+          <Btn onClick={handleSave} disabled={saving}>
+            {saving ? 'Guardando...' : editando ? 'Guardar' : 'Registrar'}
+          </Btn>
         </div>
       </Modal>
     </div>

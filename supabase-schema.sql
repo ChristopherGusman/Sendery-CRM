@@ -122,10 +122,19 @@ CREATE TABLE IF NOT EXISTS movimientos (
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- Índice único parcial para evitar movimientos duplicados en importación
-CREATE UNIQUE INDEX IF NOT EXISTS movimientos_ref_unique
-  ON movimientos(referencia)
-  WHERE referencia IS NOT NULL AND referencia != '';
+-- ── Candados anti-duplicados ────────────────────────────────────
+-- Una referencia/comprobante identifica UN solo registro. Con esto la
+-- base rechaza por sí sola un abono, gasto o movimiento repetido,
+-- aunque el frontend falle o alguien haga doble clic.
+--
+-- Son índices únicos NORMALES, no parciales: PostgreSQL no admite un
+-- índice parcial como destino de ON CONFLICT, y los upserts del
+-- importador dependen de eso. Los valores NULL no chocan entre sí, así
+-- que los registros sin referencia conviven sin problema — por eso el
+-- código guarda NULL (no cadena vacía) cuando no hay referencia.
+CREATE UNIQUE INDEX IF NOT EXISTS movimientos_referencia_key ON movimientos (referencia);
+CREATE UNIQUE INDEX IF NOT EXISTS abonos_referencia_key      ON abonos (referencia);
+CREATE UNIQUE INDEX IF NOT EXISTS gastos_comprobante_key     ON gastos (comprobante);
 
 -- LOG DE IMPORTACIONES EXCEL
 CREATE TABLE IF NOT EXISTS excel_imports_log (

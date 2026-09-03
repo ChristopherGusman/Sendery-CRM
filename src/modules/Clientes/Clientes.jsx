@@ -17,6 +17,9 @@ export default function Clientes() {
   const [editando, setEditando] = useState(null)
   const [form, setForm] = useState(EMPTY)
   const [errors, setErrors] = useState({})
+  // Candado contra doble clic: dos clics seguidos en el botón de guardar
+  // insertaban el registro dos veces.
+  const [saving, setSaving] = useState(false)
   const [detalle, setDetalle] = useState(null)
   const [historial, setHistorial] = useState([])
 
@@ -25,15 +28,26 @@ export default function Clientes() {
   async function loadClientes() {
     const { data } = await supabase
       .from('clientes')
-      .select('*, participantes(evento_id, saldo_pendiente), abonos(monto)')
+      .select('*, participantes(id, evento_id, monto_total_acordado, abonos(monto))')
       .order('nombre')
 
-    const rows = (data || []).map(c => ({
-      ...c,
-      total_eventos: new Set((c.participantes || []).map(p => p.evento_id)).size,
-      total_pagado: (c.abonos || []).reduce((s, a) => s + Number(a.monto), 0),
-      deuda_activa: (c.participantes || []).reduce((s, p) => s + Number(p.saldo_pendiente), 0),
-    }))
+    // Todo se calcula desde una sola fuente: los abonos colgados de cada
+    // participación. Antes "Total pagado" salía de abonos.cliente_id y el
+    // historial de abonos.participante_id — dos caminos distintos para el
+    // mismo número, que no cuadraban entre sí. Y "Deuda activa" venía del
+    // campo saldo_pendiente, que se desincroniza en cuanto algo falla a la
+    // mitad de un registro de abono.
+    const rows = (data || []).map(c => {
+      const parts = c.participantes || []
+      const sumaAbonos = pt => (pt.abonos || []).reduce((a, b) => a + Number(b.monto), 0)
+      return {
+        ...c,
+        total_eventos: new Set(parts.map(pt => pt.evento_id)).size,
+        total_pagado: parts.reduce((s, pt) => s + sumaAbonos(pt), 0),
+        deuda_activa: parts.reduce(
+          (s, pt) => s + Math.max(0, Number(pt.monto_total_acordado) - sumaAbonos(pt)), 0),
+      }
+    })
     setClientes(rows)
   }
 
@@ -44,14 +58,25 @@ export default function Clientes() {
       .select('*, eventos(nombre, fecha, tipo), abonos(monto)')
       .eq('cliente_id', c.id)
 
-    const h = (data || []).map(p => ({
-      evento: p.eventos?.nombre || '',
-      fecha: p.eventos?.fecha || '',
-      tipo: p.eventos?.tipo || '',
-      monto_total_acordado: p.monto_total_acordado,
-      saldo_pendiente: p.saldo_pendiente,
-      pagado: (p.abonos || []).reduce((s, a) => s + Number(a.monto), 0),
-    })).sort((a, b) => (b.fecha || '').localeCompare(a.fecha || ''))
+    const filas = data || []
+    // Un cliente inscrito dos veces en el mismo evento aparece dos veces aquí
+    // y su deuda se cuenta doble. Se marca para avisarlo en pantalla.
+    const vecesPorEvento = {}
+    filas.forEach(p => { vecesPorEvento[p.evento_id] = (vecesPorEvento[p.evento_id] || 0) + 1 })
+
+    const h = filas.map(p => {
+      const pagado = (p.abonos || []).reduce((s, a) => s + Number(a.monto), 0)
+      return {
+        evento: p.eventos?.nombre || '',
+        fecha: p.eventos?.fecha || '',
+        tipo: p.eventos?.tipo || '',
+        monto_total_acordado: Number(p.monto_total_acordado),
+        // Saldo calculado desde los abonos reales, no el campo guardado.
+        saldo_pendiente: Math.max(0, Number(p.monto_total_acordado) - pagado),
+        pagado,
+        repetido: vecesPorEvento[p.evento_id] > 1,
+      }
+    }).sort((a, b) => (b.fecha || '').localeCompare(a.fecha || ''))
     setHistorial(h)
   }
 
@@ -81,17 +106,21 @@ export default function Clientes() {
   }
 
   async function handleSave() {
-    if (!validate()) return
+    if (saving || !validate()) return
     const payload = {
       nombre: form.nombre, telefono: form.telefono, email: form.email,
       ciudad: form.ciudad, fecha_registro: form.fecha_registro, notas: form.notas
     }
-    if (editando) {
-      await supabase.from('clientes').update(payload).eq('id', editando)
-    } else {
-      await supabase.from('clientes').insert(payload)
+    setSaving(true)
+    try {
+      const { error } = editando
+        ? await supabase.from('clientes').update(payload).eq('id', editando)
+        : await supabase.from('clientes').insert(payload)
+      if (error) { alert(`No se pudo guardar: ${error.message}`); return }
+      setModal(false); loadClientes()
+    } finally {
+      setSaving(false)
     }
-    setModal(false); loadClientes()
   }
 
   async function deleteCliente(id) {
@@ -218,6 +247,17 @@ export default function Clientes() {
                 <div style={{ fontFamily: 'DM Sans', fontSize: 12, fontWeight: 600, color: '#2C3A1A', marginBottom: 8 }}>
                   Historial de eventos
                 </div>
+                {historial.some(h => h.repetido) && (
+                  <div style={{
+                    background: '#FCECEA', border: '1px solid #f5c6c6', borderRadius: 8,
+                    padding: '8px 10px', marginBottom: 10,
+                    fontFamily: 'DM Sans', fontSize: 11, color: '#8B1A1A'
+                  }}>
+                    Este cliente está inscrito más de una vez en el mismo evento
+                    (marcado abajo). Su deuda se está contando doble — únelo desde
+                    el evento borrando el registro sobrante.
+                  </div>
+                )}
                 {historial.length === 0 ? (
                   <div style={{ fontSize: 12, color: '#6B7B4F', fontFamily: 'DM Sans' }}>Sin participaciones</div>
                 ) : historial.map((h, i) => {
@@ -226,6 +266,9 @@ export default function Clientes() {
                     <div key={i} style={{ borderBottom: '1px solid rgba(196,169,125,0.12)', paddingBottom: 10, marginBottom: 10 }}>
                       <div style={{ fontFamily: 'DM Sans', fontSize: 12, fontWeight: 600, color: '#2C3A1A', marginBottom: 3 }}>
                         {h.tipo === 'caminata' ? '🥾' : '✈️'} {h.evento}
+                        {h.repetido && (
+                          <span style={{ color: '#8B1A1A', fontWeight: 700 }} title="Inscripción repetida en este evento"> ⚠ repetido</span>
+                        )}
                       </div>
                       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                         <span style={{ fontSize: 11, color: '#6B7B4F' }}>{formatDate(h.fecha)}</span>
@@ -266,7 +309,9 @@ export default function Clientes() {
         </div>
         <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end', marginTop: 20 }}>
           <Btn variant="outline" onClick={() => setModal(false)}>Cancelar</Btn>
-          <Btn onClick={handleSave}>{editando ? 'Guardar' : 'Crear Cliente'}</Btn>
+          <Btn onClick={handleSave} disabled={saving}>
+            {saving ? 'Guardando...' : editando ? 'Guardar' : 'Crear Cliente'}
+          </Btn>
         </div>
       </Modal>
     </div>

@@ -27,6 +27,9 @@ export default function EventoDetalle() {
   const [abonoModal, setAbonoModal] = useState(null)
   const [abonoForm, setAbonoForm] = useState(EMPTY_ABONO)
   const [errors, setErrors] = useState({})
+  // Candado contra doble clic. Sin esto, dos clics seguidos en "Registrar
+  // Abono" (o en "Agregar" participante) grababan el registro dos veces.
+  const [saving, setSaving] = useState(false)
 
   useEffect(() => { loadTodo() }, [id])
 
@@ -89,20 +92,48 @@ export default function EventoDetalle() {
   }
 
   async function savePart() {
+    if (saving) return
     const e = {}
     if (!partForm.nombre_cliente.trim()) e.nombre_cliente = 'Nombre requerido'
     if (!partForm.monto_total_acordado || Number(partForm.monto_total_acordado) < 0) e.monto_total_acordado = 'Monto inválido'
     setErrors(e)
     if (Object.keys(e).length) return
 
+    setSaving(true)
+    try {
     const monto = Number(partForm.monto_total_acordado)
+
+    // Si el nombre coincide con un cliente existente, se vincula solo.
+    // Un participante sin cliente_id deja sus abonos huérfanos: no aparecen
+    // en el estado de cuenta del cliente aunque estén cobrados.
+    let clienteId = partForm.cliente_id || null
+    if (!clienteId) {
+      const match = clientes.find(c =>
+        c.nombre.trim().toLowerCase() === partForm.nombre_cliente.trim().toLowerCase())
+      if (match) clienteId = match.id
+    }
+
+    // Un mismo cliente inscrito dos veces en el mismo evento duplica su
+    // deuda y hace que el evento aparezca repetido en su estado de cuenta.
+    if (!editPart) {
+      const yaInscrito = participantes.find(pt =>
+        (clienteId && pt.cliente_id == clienteId) ||
+        pt.nombre_cliente.trim().toLowerCase() === partForm.nombre_cliente.trim().toLowerCase())
+      if (yaInscrito && !confirm(
+        `${yaInscrito.nombre_cliente} ya está inscrito en este evento ` +
+        `(acordado ${formatMXN(yaInscrito.monto_total_acordado)}, saldo ${formatMXN(yaInscrito.saldo_pendiente)}).\n\n` +
+        `Inscribirlo otra vez duplicará su deuda y su estado de cuenta.\n\n` +
+        `¿Agregar de todas formas un segundo registro?`
+      )) return
+    }
+
     if (editPart) {
       const { data: abonosData } = await supabase
         .from('abonos').select('monto').eq('participante_id', editPart)
       const abonosSum = (abonosData || []).reduce((s, a) => s + Number(a.monto), 0)
       const newSaldo = Math.max(0, monto - abonosSum)
       await supabase.from('participantes').update({
-        cliente_id: partForm.cliente_id || null,
+        cliente_id: clienteId,
         nombre_cliente: partForm.nombre_cliente,
         monto_total_acordado: monto,
         saldo_pendiente: newSaldo,
@@ -112,7 +143,7 @@ export default function EventoDetalle() {
     } else {
       await supabase.from('participantes').insert({
         evento_id: Number(id),
-        cliente_id: partForm.cliente_id || null,
+        cliente_id: clienteId,
         nombre_cliente: partForm.nombre_cliente,
         monto_total_acordado: monto,
         saldo_pendiente: monto,
@@ -122,6 +153,9 @@ export default function EventoDetalle() {
     }
     setPartModal(false)
     loadTodo()
+    } finally {
+      setSaving(false)
+    }
   }
 
   async function deletePart(pid) {
@@ -134,58 +168,116 @@ export default function EventoDetalle() {
   // ── Abono ───────────────────────────────────────────────────
   function openAbono(p) {
     setAbonoModal(p)
-    setAbonoForm({ ...EMPTY_ABONO, cuenta_destino: p.cuenta_destino_pago || '' })
+    // today() se recalcula al abrir el modal. EMPTY_ABONO se evalúa una sola
+    // vez al cargar el módulo, así que si la pestaña quedaba abierta de un día
+    // para otro el abono se guardaba con la fecha de ayer.
+    setAbonoForm({ ...EMPTY_ABONO, fecha: today(), cuenta_destino: p.cuenta_destino_pago || '' })
     setErrors({})
   }
 
   async function saveAbono() {
+    if (saving) return
     const e = {}
     if (!abonoForm.fecha) e.fecha = 'Fecha requerida'
     if (!abonoForm.monto || Number(abonoForm.monto) <= 0) e.monto = 'Monto inválido'
     setErrors(e)
     if (Object.keys(e).length) return
 
-    const monto = Number(abonoForm.monto)
-    const folio = abonoForm.referencia || generateFolio('ABN')
+    setSaving(true)
+    try {
+      const monto = Number(abonoForm.monto)
+      const folio = (abonoForm.referencia || '').trim() || generateFolio('ABN')
 
-    await supabase.from('abonos').insert({
-      participante_id: abonoModal.id,
-      evento_id: Number(id),
-      cliente_id: abonoModal.cliente_id || null,
-      fecha: abonoForm.fecha,
-      monto,
-      referencia: folio,
-      cuenta_destino: abonoForm.cuenta_destino,
-      notas: abonoForm.notas,
-    })
+      // Aviso de posible doble registro. El folio automático es distinto cada
+      // vez, así que el índice único no puede detectar este caso: es el mismo
+      // pago capturado dos veces (misma persona, misma fecha, mismo monto).
+      const { data: iguales } = await supabase
+        .from('abonos').select('id')
+        .eq('participante_id', abonoModal.id)
+        .eq('fecha', abonoForm.fecha)
+        .eq('monto', monto)
+      if (iguales?.length && !confirm(
+        `Ya hay un abono de ${formatMXN(monto)} para ${abonoModal.nombre_cliente} ` +
+        `con fecha ${formatDate(abonoForm.fecha)}.\n\n` +
+        `¿Es un pago distinto por la misma cantidad y el mismo día?\n\n` +
+        `Acepta solo si de verdad son dos pagos separados.`
+      )) return
 
-    const newSaldo = Math.max(0, Number(abonoModal.saldo_pendiente) - monto)
-    await supabase.from('participantes').update({
-      saldo_pendiente: newSaldo,
-      fecha_ultimo_pago: abonoForm.fecha,
-    }).eq('id', abonoModal.id)
+      // El abono se cuelga del cliente del participante. Si el participante
+      // no tenía cliente vinculado pero el nombre coincide con uno, se
+      // vincula ahora: si no, el abono nunca aparece en su estado de cuenta.
+      let clienteId = abonoModal.cliente_id || null
+      if (!clienteId) {
+        const match = clientes.find(c =>
+          c.nombre.trim().toLowerCase() === abonoModal.nombre_cliente.trim().toLowerCase())
+        if (match) {
+          clienteId = match.id
+          await supabase.from('participantes')
+            .update({ cliente_id: clienteId }).eq('id', abonoModal.id)
+        }
+      }
 
-    const cuenta = cuentas.find(c =>
-      `${c.banco} ${c.ultimos_4}` === abonoForm.cuenta_destino ||
-      c.banco === abonoForm.cuenta_destino
-    )
-    if (cuenta) {
-      await supabase.from('movimientos').insert({
-        cuenta_id: cuenta.id,
-        fecha: abonoForm.fecha,
-        tipo: 'ingreso',
-        concepto: `Abono ${abonoModal.nombre_cliente} — ${evento.nombre}`,
-        importe: monto,
-        referencia: folio,
+      // Con el índice único en abonos(referencia), un segundo intento con el
+      // mismo folio falla en la base en vez de crear un abono repetido.
+      const { error: errAbono } = await supabase.from('abonos').insert({
+        participante_id: abonoModal.id,
         evento_id: Number(id),
+        cliente_id: clienteId,
+        fecha: abonoForm.fecha,
+        monto,
+        referencia: folio,
+        cuenta_destino: abonoForm.cuenta_destino,
+        notas: abonoForm.notas,
       })
-      await supabase.from('cuentas_bancarias')
-        .update({ saldo_actual: cuenta.saldo_actual + monto })
-        .eq('id', cuenta.id)
-    }
+      if (errAbono) {
+        alert(errAbono.code === '23505'
+          ? `Ya existe un abono con la referencia "${folio}". No se registró de nuevo.`
+          : `No se pudo registrar el abono: ${errAbono.message}`)
+        return
+      }
 
-    setAbonoModal(null)
-    loadTodo()
+      // Saldo recalculado desde los abonos reales del participante. Antes se
+      // restaba sobre el valor que traía la pantalla, así que si esa vista
+      // estaba desfasada el saldo quedaba mal.
+      const { data: abonosData } = await supabase
+        .from('abonos').select('monto').eq('participante_id', abonoModal.id)
+      const pagado = (abonosData || []).reduce((s, a) => s + Number(a.monto), 0)
+      const newSaldo = Math.max(0, Number(abonoModal.monto_total_acordado) - pagado)
+      await supabase.from('participantes').update({
+        saldo_pendiente: newSaldo,
+        fecha_ultimo_pago: abonoForm.fecha,
+      }).eq('id', abonoModal.id)
+
+      const cuenta = cuentas.find(c =>
+        `${c.banco} ${c.ultimos_4}` === abonoForm.cuenta_destino ||
+        c.banco === abonoForm.cuenta_destino
+      )
+      if (cuenta) {
+        const { error: errMov } = await supabase.from('movimientos').insert({
+          cuenta_id: cuenta.id,
+          fecha: abonoForm.fecha,
+          tipo: 'ingreso',
+          concepto: `Abono ${abonoModal.nombre_cliente} — ${evento.nombre}`,
+          importe: monto,
+          referencia: folio,
+          evento_id: Number(id),
+        })
+        // Solo se suma al saldo si el movimiento entró de verdad. Si chocó con
+        // un movimiento del mismo folio, sumar aquí inflaba la cuenta.
+        if (!errMov) {
+          const { data: cAct } = await supabase
+            .from('cuentas_bancarias').select('saldo_actual').eq('id', cuenta.id).single()
+          await supabase.from('cuentas_bancarias')
+            .update({ saldo_actual: Number(cAct?.saldo_actual || 0) + monto })
+            .eq('id', cuenta.id)
+        }
+      }
+
+      setAbonoModal(null)
+      loadTodo()
+    } finally {
+      setSaving(false)
+    }
   }
 
   const fp = (k, v) => setPartForm(p => ({ ...p, [k]: v }))
@@ -428,7 +520,9 @@ export default function EventoDetalle() {
         </div>
         <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end', marginTop: 20 }}>
           <Btn variant="outline" onClick={() => setPartModal(false)}>Cancelar</Btn>
-          <Btn onClick={savePart}>{editPart ? 'Guardar' : 'Agregar'}</Btn>
+          <Btn onClick={savePart} disabled={saving}>
+            {saving ? 'Guardando...' : editPart ? 'Guardar' : 'Agregar'}
+          </Btn>
         </div>
       </Modal>
 
@@ -457,7 +551,7 @@ export default function EventoDetalle() {
               </FormField>
               <FormField label="Referencia / Folio" hint="Se genera automáticamente si se deja en blanco">
                 <Input value={abonoForm.referencia} onChange={e => fa('referencia', e.target.value)}
-                  placeholder={generateFolio('ABN')} />
+                  placeholder="(se asigna un folio automático)" />
               </FormField>
               <FormField label="Cuenta destino">
                 <Select value={abonoForm.cuenta_destino} onChange={e => fa('cuenta_destino', e.target.value)}>
@@ -475,8 +569,8 @@ export default function EventoDetalle() {
             </div>
             <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end', marginTop: 20 }}>
               <Btn variant="outline" onClick={() => setAbonoModal(null)}>Cancelar</Btn>
-              <Btn onClick={saveAbono} variant="secondary" icon={<DollarSign size={14}/>}>
-                Registrar Abono
+              <Btn onClick={saveAbono} variant="secondary" disabled={saving} icon={<DollarSign size={14}/>}>
+                {saving ? 'Registrando...' : 'Registrar Abono'}
               </Btn>
             </div>
           </>
